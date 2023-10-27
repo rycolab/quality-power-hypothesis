@@ -1,0 +1,209 @@
+---
+title: "dll_analysis"
+author: "Ethan"
+date: "2023-04-24"
+output: html_document
+---
+
+```{r}
+shhh <- suppressPackageStartupMessages # It's a library, so shhh!
+
+shhh(library( mgcv ))
+shhh(library(dplyr))
+shhh(library(ggplot2))
+shhh(library(lme4))
+shhh(library(tidymv))
+shhh(library(gamlss))
+shhh(library(gsubfn))
+shhh(library(lmerTest))
+shhh(library(tidyverse))
+shhh(library(boot))
+shhh(library(rsample))
+shhh(library(plotrix))
+shhh(library(ggrepel))
+shhh(library(mgcv))
+library(jmuOutlier) # For paired permutation tests
+
+#options(JULIA_HOME = "/Applications/Julia-1.8.app/Contents/Resources/julia/bin/")
+#library(jglmm)
+#jglmm_setup()
+
+theme_set(theme_bw())
+options(digits=4)
+options(dplyr.summarise.inform = FALSE)
+```
+
+```{r}
+
+set.seed(444)
+langs = c("du","en", "fi", "ge", "gr", "he", "it", "no", "ru", "sp", "tr")
+
+psychometrics = c("gaze_rt")
+comps = c("target", "baseline")
+
+```
+
+## Compute DLL for Each Language
+
+```{r}
+
+model_cross_val = function(form, df, d_var, mixed_effects, num_folds=10){
+  
+  folds <- cut(seq(1,nrow(df)),breaks=num_folds,labels=FALSE)
+  
+  estimates <- c()
+  models <- c()
+  for(i in 1:num_folds){
+    testIndexes = which(folds==i,arr.ind=TRUE)
+    testData = df[testIndexes,]
+    trainData = df[-testIndexes,]
+
+    if(mixed_effects){
+      #model = lmer(as.formula(form), data = trainData)
+      model = jglmm(as.formula(form), data = trainData)
+
+    } else {
+      model = lm(as.formula(form), data = trainData)
+    }
+
+    stdev = sigma(model)
+    densities <- log(dnorm(testData[[d_var]],
+                          mean=predict(model, newdata=testData),
+                          sd=stdev))
+
+    estimates <- c(estimates, densities)
+  }
+
+  return(estimates)
+}
+
+```
+
+
+```{r, warning=FALSE}
+
+
+regression_names = c("target", "baseline")
+
+
+dll_raw_df = data.frame()
+for (lang in langs) {
+
+  print(paste0("Fitting model for ", lang))
+  
+  df = read.csv(paste0("../MECO/tainted_meco_merged/", lang, "_merged.csv"))
+  models = unique(df$model)
+  
+  for (m in models) {
+    
+    print(paste0(" --- ", m))
+    
+    df_eval = df %>% filter(model == m) %>%
+      drop_na() %>% distinct() %>%
+      filter(sample_id == prev2_sample)
+  
+    for (psychometric in psychometrics) {
+      
+      regression_forms = c(
+        paste0(psychometric, " ~ surp + prev_surp + prev2_surp + renyi + prev_renyi + prev2_renyi + freq + len + prev_freq + prev_len + prev2_freq + prev2_len"),
+        paste0(psychometric, " ~ freq + len + prev_freq + prev_len + prev2_freq + prev2_len")
+      )
+      regression_names = c("target", "baseline")
+
+      
+      loglik_df = data.frame(names=regression_names, forms=regression_forms) %>%
+        mutate(logliks = map(regression_forms, model_cross_val, df=df_eval, d_var=psychometric, mixed_effects=F )) %>%
+        dplyr::select(-forms)
+      
+      loglik_df = loglik_df %>% unnest(cols = c(logliks)) %>% mutate(lang = lang, psychometric = psychometric, model = m)
+      dll_raw_df = rbind(dll_raw_df, loglik_df)
+      
+    }
+  }
+}
+
+
+
+```
+
+## Data for each language individually
+
+```{r}
+comps = c("target")
+
+dll_xlang_df = data.frame()
+for(l in langs){
+  
+  for (ps in psychometrics){
+    for(c in comps){
+
+      models = dll_raw_df %>% filter(lang == l)
+      models = unique(models$model)
+      
+      for(m in models) {
+
+        if(c != "baseline") {
+          target_df = dll_raw_df %>% filter(psychometric == ps, names == c, lang == l, model == m)
+          baseline_df = dll_raw_df %>% filter(psychometric == ps, names == "baseline", lang == l, model == m)
+          dll = target_df$logliks - baseline_df$logliks
+          dll = dll[!is.na(dll)]
+          dll_df = data.frame(comp = c, dll = dll,
+                              lang = l, psychometric = ps, model = m)
+          dll_xlang_df = rbind(dll_xlang_df, dll_df)
+        }
+      }
+    }
+  }
+}
+
+```
+
+
+```{r}
+library(viridis)
+
+dll_xlang_df %>%
+  group_by(model) %>%
+    summarise(m = mean(dll), sd = std.error(dll),
+              upper = m + 1.96 * sd, lower = m - 1.96 * sd) %>%
+  ungroup() %>%
+  mutate(model = factor(model, levels = c("taint_12", "taint_6", "taint_none"), labels = c("100%", "50%", "0%"))) %>%
+
+  ggplot(aes(x = model, y = m, fill = model)) +
+    geom_bar(stat="identity") +
+    geom_errorbar(aes(ymax = upper, ymin = lower), width = 0) +
+    geom_text(aes(label = round(m, digits = 5), y = m + 0.005)) +
+    guides(fill = "none") +
+    ylab("Delta Log Likelihood\n(average per word)") +
+    xlab("Percent MECO Corpus in Training Data") +
+    scale_fill_viridis(discrete = T) +
+  theme(
+    text = element_text(family="serif")
+  )
+
+ggsave("./images/leakage_analysis.pdf", device = "pdf", width = 4, height = 2.5)
+
+
+```
+
+```{r, eval=FALSE}
+
+model_sizes=data.frame(
+  lang = c("du","en", "fi", "ge", "gr", "he", "it", "no", "ru", "sp", "tr", "ee", "ko"),
+  model_size = c(171207875, 1966812101, 89302801, 883594507, 57856984, 112764698, 376994758, 
+           69803344, 488947239, 508612930, 48431000, 508612930, 75613314)
+)
+
+m = dll_xlang_df %>%
+  merge(model_sizes, by=c("lang")) %>%
+  #filter(model %in% c("taint_none", "taint_6")) %>%
+  filter(model %in% c("taint_none", "taint_12")) %>%
+  mutate(taint = if_else(model == "taint_none", 0, 1)) %>%
+  mutate(model_size = round(log(model_size), digits = 1)) %>%
+  mutate(lang = as.factor(lang))  %>%
+  lmer(dll ~ taint + (taint | lang) + (taint | model_size), data=. )
+summary(m)
+
+
+```
+

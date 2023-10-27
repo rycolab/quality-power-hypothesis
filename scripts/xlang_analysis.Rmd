@@ -1,0 +1,305 @@
+---
+title: "Crossling Analysis"
+author: "Ethan"
+date: "2023-04-24"
+output: html_document
+---
+
+```{r}
+shhh <- suppressPackageStartupMessages # It's a library, so shhh!
+
+shhh(library( mgcv ))
+shhh(library(dplyr))
+shhh(library(ggplot2))
+shhh(library(lme4))
+shhh(library(tidymv))
+shhh(library(gamlss))
+shhh(library(gsubfn))
+shhh(library(lmerTest))
+shhh(library(tidyverse))
+shhh(library(boot))
+shhh(library(rsample))
+shhh(library(plotrix))
+shhh(library(ggrepel))
+shhh(library(mgcv))
+library(jmuOutlier) # For paired permutation tests
+
+theme_set(theme_bw())
+options(digits=4)
+options(dplyr.summarise.inform = FALSE)
+```
+
+
+
+```{r}
+
+set.seed(444)
+
+# List of language codes
+langs = c("du", "ee", "en", "fi", "ge", "gr", "he", "it", "ko", "no", "ru", "sp", "tr")
+
+psychometrics = c("gaze_rt")
+comps = c("target", "baseline")
+taints = c("none")
+
+```
+
+### Compute DLL for Each Language
+
+```{r}
+
+model_cross_val = function(form, df, d_var, mixed_effects, num_folds=10){
+  
+  folds <- cut(seq(1,nrow(df)),breaks=num_folds,labels=FALSE)
+  
+  estimates <- c()
+  models <- c()
+  for(i in 1:num_folds){
+    testIndexes = which(folds==i,arr.ind=TRUE)
+    testData = df[testIndexes,]
+    trainData = df[-testIndexes,]
+
+    if(mixed_effects){
+      model = lmer(as.formula(form), data = trainData)
+    } else {
+      model = lm(as.formula(form), data = trainData)
+    }
+
+    stdev = sigma(model)
+    densities <- log(dnorm(testData[[d_var]],
+                          mean=predict(model, newdata=testData),
+                          sd=stdev))
+
+    estimates <- c(estimates, densities)
+  }
+
+  return(estimates)
+}
+
+```
+
+
+```{r, warning=FALSE}
+
+
+regression_names = c("target", "baseline")
+
+dll_raw_df = data.frame()
+for (lang in langs) {
+
+  print(paste0("Fitting model for ", lang))
+  
+  df = read.csv(paste0("../MECO/meco_merged/", lang, "_merged.csv")) %>%
+    # Have to log the freqs!
+    mutate(freq = log(freq), prev_freq = log(prev_freq), prev2_freq = log(prev2_freq))
+  models = unique(df$model)
+  
+  for (m in models) {
+  print(paste0(" --- ", m))
+  for (t in taints) {
+    
+    df_eval = df %>% filter(model == m, taint == t) %>%
+      drop_na() %>% distinct() %>%
+      filter(sample_id == prev2_sample)
+    model_size = unique(df_eval$model_size)
+    
+    if(nrow(df_eval) > 0){
+        for (psychometric in psychometrics) {
+          
+          regression_forms = c(
+            # Depending on which analysis you want to run, simply uncomment one of the following three TARGET models
+            #paste0(psychometric, " ~ surp + prev_surp + prev2_surp + renyi + prev_renyi + prev2_renyi + freq + len + prev_freq + prev_len + prev2_freq + prev2_len"),
+            paste0(psychometric, " ~ renyi + prev_renyi + prev2_renyi + freq + len + prev_freq + prev_len + prev2_freq + prev2_len"),
+            #paste0(psychometric, " ~ surp + prev_surp + prev2_surp + freq + len + prev_freq + prev_len + prev2_freq + prev2_len"),
+            
+            # BELOW is the BASELINE model. Don't uncomment
+            paste0(psychometric, " ~ freq + len + prev_freq + prev_len + prev2_freq + prev2_len")
+          )
+          regression_names = c("target", "baseline")
+    
+          loglik_df = data.frame(names=regression_names, forms=regression_forms) %>%
+            mutate(logliks = map(regression_forms, model_cross_val, df=df_eval, d_var=psychometric, mixed_effects=F )) %>%
+            dplyr::select(-forms)
+          
+          loglik_df = loglik_df %>% unnest(cols = c(logliks)) %>% mutate(lang = lang, psychometric = psychometric, model = m, taint = t, model_size = model_size)
+          dll_raw_df = rbind(dll_raw_df, loglik_df)
+        }
+      }
+    }
+  }
+}
+
+
+```
+
+## Data for each language individually
+
+```{r}
+c = c("target")
+
+dll_xlang_surp_df = data.frame()
+dll_all_df = data.frame()
+for(l in langs){
+  
+  print(paste0("Tests for ", l)) 
+  
+  for (ps in psychometrics){
+
+      models = dll_raw_df %>% filter(lang == l)
+      models = unique(models$model)
+      
+      for(m in models) {
+      for(t in taints) {
+
+        if(c != "baseline") {
+          target_df = dll_raw_df %>% filter(psychometric == ps, names == "target", lang == l, model == m, taint == t)
+          baseline_df = dll_raw_df %>% filter(psychometric == ps, names == "baseline", lang == l, model == m, taint == t)
+          model_size = unique(target_df$model_size)
+          if(nrow(target_df > 0)) {
+            dll = target_df$logliks - baseline_df$logliks
+            dll = dll[!is.na(dll)]
+            
+            dll_temp = data.frame(dll = dll,lang = l, psychometric = ps, model = m, taint = t)
+            dll_all_df = rbind(dll_all_df, dll_temp)
+            
+            # Calculate the mean and SD DLLs
+            dll_df = data.frame(comp = c, mean = mean(dll), upper = mean(dll) + (1.96 * std.error(dll)),
+                                lower = mean(dll) - (1.96 * std.error(dll)),
+                                lang = l, psychometric = ps, model = m, taint = t, model_size = model_size)
+            dll_xlang_surp_df = rbind(dll_xlang_surp_df, dll_df)
+          }
+        }
+      }
+    }
+  }
+}
+
+
+```
+
+## Get PPL and X-Ent values for our languages
+
+```{r}
+ppl_df = data.frame()
+for (l in langs) {
+
+  df = read.csv(paste0("../MECO/meco_merged/", l, "_merged.csv"))
+  models = unique(df$model)
+  
+  for (m in models) {
+  for (t in taints) {
+    
+    for (ps in psychometrics) {
+      
+          temp_df = df %>% filter(model == m, taint == t)
+          temp_df = temp_df %>% dplyr::select(surp)
+           temp_df = temp_df %>% drop_na() %>% distinct() %>%
+            summarise(avg_surp = mean(surp),
+                      ppl = 2 ^ avg_surp)
+          ppl_df = rbind(ppl_df, temp_df %>% mutate(lang = l, model = m, taint = t))
+    }}}}
+
+```
+
+
+
+```{r}
+# Merge the dataframes
+dll_surp_plotting_df = dll_xlang_surp_df %>%
+  merge(ppl_df, by = c("lang", "model", "taint"))
+```
+
+## Statistical Tests
+
+```{r, options(scipen=999)}
+
+stats_df = data.frame()
+for (l in langs) {
+
+  temp_df = dll_surp_plotting_df %>% filter(lang == l, taint=="none") %>%   mutate(model_size = round(log10(model_size), digits = 0))
+  model = lm(mean ~ avg_surp, data = temp_df)
+  pval = summary(model)$coefficients[8]
+  est = summary(model)$coefficient[2]
+  
+  cor_test = cor.test(temp_df$avg_surp, temp_df$mean)
+  cor_pval = cor_test$p.value
+  cor_r = cor_test$estimate
+  
+  stats_df = rbind(stats_df, data.frame(lang =l, pval = pval, est = est, cor_pval = cor_pval, cor_r = round(cor_r, 2)))
+}
+
+stats_df
+
+```
+## Plotting
+
+```{r}
+
+options(scipen=999)
+library(viridis)
+
+pval_func = function(pval) {
+  if_else(pval >= 0.05 , ">0.05",
+          if_else(pval < 0.05 & pval >= 0.01, "<0.05",
+                  if_else(pval < 0.01 & pval >= 0.001, "<0.01",
+                          if_else(pval < 0.001,
+                                  "<0.001",""))))
+}
+
+dll_surp_plotting_df %>%
+  merge(., stats_df, by=c("lang")) %>%
+  mutate(lang = factor(lang, levels = c("du", "ee", "en", "fi", "ge", "gr", "he", "it", "ko", "no", "ru", "sp", "tr"),
+                       labels = c("Dutch", "Estonian", "English", "Finnish", "German", "Greek", "Hebrew", "Italian",
+                                  "Korean", "Norwegian", "Russian", "Spanish", "Turkish"))) %>%
+  filter(taint == "none") %>%
+  mutate(model_size = as.integer(model_size)) %>%
+  mutate(`Log Training \n     Tokens` = log10(model_size)) %>%
+  filter(comp == "target") %>%
+  rename(target = comp) %>%
+  mutate(cor_pval = pval_func(cor_pval)) %>%
+  mutate(test_label = paste0("r=", cor_r, ", p", cor_pval)) %>%
+  group_by(lang) %>%
+    mutate(lang_ymax=max(mean), lang_xmax = max(avg_surp)) %>%
+  ungroup() %>%
+
+  ggplot(aes(color = `Log Training \n     Tokens`)) +
+    geom_hline(yintercept=0, color="black", linetype="dashed", alpha =0.5) +
+    geom_smooth(aes(y = mean, x = avg_surp), method="lm", color = "blue", linetype="dashed", size = 0.3, alpha = 0.5) +
+    geom_point(aes(y = mean, x = avg_surp), size = 2) +
+    geom_errorbar(aes(ymin=lower, ymax=upper, x = avg_surp), width = 0) +
+
+    geom_label(aes(y=Inf, x=Inf, label=test_label), color = "blue", vjust = 1, hjust =1, size = 2.3, label.size  = NA, family = "serif") +
+  
+    ylab("Delta Log Likelihood (average  per word)") + 
+    xlab("Cross Entropy (on MECO)") +
+    facet_wrap(.~lang, nrow = 3, scales = "free_y") +
+    scale_color_viridis() +
+  theme(
+    text = element_text(family = "serif"),
+    legend.position = c(0.8,0.1),
+    legend.direction="horizontal",
+    axis.text.y = element_text(size = 6, angle = 45, hjust = 0.5)#,
+    #panel.border = element_rect(color = "grey", fill =  NA, size = 0.5)
+  )
+
+# Uncomment based on which analysis you are running
+ggsave("./images/results_entropy.pdf", device = "pdf", width = 8, height = 4.5)
+#ggsave("./images/results_surp.pdf", device = "pdf", width = 8, height = 4.5)
+#ggsave("./images/results_ent_surp.pdf", device = "pdf", width = 8, height = 4.5)
+
+
+```
+
+## Crosslingual Analysis (w/ Random Effects)
+
+```{r}
+
+m = dll_surp_plotting_df %>%
+  filter(taint=="none") %>%
+  mutate(model = round(log10(model_size), digits = 1)) %>%
+  lmer(mean ~ avg_surp + (avg_surp | lang) , data = .)
+summary(m)
+
+```
+
+
